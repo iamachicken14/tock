@@ -9,6 +9,18 @@ addons:
       - python3-pip
 
 
+# OS X builds are slower and with annoyingly non-deterministic latency.
+# However, we would like to make sure that nothing slips through that won't run
+# on OS X, so we configure travis to run OS X tests on `staging`, which is the
+# branch that bors uses to test merge candidates and on `master`, to make sure
+# any errant manual merges don't break things.
+jobs:
+  include:
+    - if: ( branch = staging ) OR ( branch = master )
+      os: osx
+    - os: linux
+
+
 # bors default configuration:
 #branches:
 #  only:
@@ -29,8 +41,6 @@ branches:
 cache:
   cargo: true
 
-os:
-  - linux
 
 # If you change this, you must also change Getting_Started.md, Makefile.common,
 # .vscode/settings.json, and tools/netlify-build.sh.
