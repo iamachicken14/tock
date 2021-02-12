@@ -109,17 +109,62 @@ impl UsciSpiRef for StaticRef<usci::UsciARegisters> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum TransmissionType {
+enum OperatingMode {
+    Unconfigured,
     Idle,
     Write,
     WriteRead,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u16)]
+enum SpiClock {
+    K1500 = 0, // 1.5MHz
+    K750 = 1,  // 750kHz
+    K500 = 2,  // 500kHz
+    K375 = 3,  // 375kHz
+    K300 = 4,  // 300kHz
+    K250 = 5,  // 250kHz
+    K150 = 9,  // 150kHz
+    K100 = 14, // 100kHz
+}
+
+impl From<u32> for SpiClock {
+    fn from(rate: u32) -> Self {
+        match rate {
+            0..=124_999 => SpiClock::K100,
+            125_000..=199_999 => SpiClock::K150,
+            200_000..=274_999 => SpiClock::K250,
+            275_000..=337_499 => SpiClock::K300,
+            337_500..=437_499 => SpiClock::K375,
+            437_500..=624_999 => SpiClock::K500,
+            625_000..=1124_999 => SpiClock::K750,
+            _ => SpiClock::K1500,
+        }
+    }
+}
+
+impl From<SpiClock> for u32 {
+    fn from(clk: SpiClock) -> Self {
+        match clk {
+            SpiClock::K100 => 100_000,
+            SpiClock::K150 => 150_000,
+            SpiClock::K250 => 250_000,
+            SpiClock::K300 => 300_000,
+            SpiClock::K375 => 375_000,
+            SpiClock::K500 => 500_000,
+            SpiClock::K750 => 750_000,
+            SpiClock::K1500 => 1_500_000,
+        }
+    }
 }
 
 pub struct Spi<'a> {
     registers: &'static dyn UsciSpiRef,
     cs: OptionalCell<&'a dyn Pin>,
     hold_cs: Cell<bool>,
-    transmission_type: Cell<TransmissionType>,
+    operating_mode: Cell<OperatingMode>,
+    clock: Cell<SpiClock>,
     tx_buf: TakeCell<'static, [u8]>,
     master_client: OptionalCell<&'a dyn spi::SpiMasterClient>,
 
@@ -144,7 +189,8 @@ impl<'a> Spi<'a> {
             registers: registers,
             cs: OptionalCell::empty(),
             hold_cs: Cell::new(false),
-            transmission_type: Cell::new(TransmissionType::Write),
+            operating_mode: Cell::new(OperatingMode::Unconfigured),
+            clock: Cell::new(SpiClock::K100),
             tx_buf: TakeCell::empty(),
             master_client: OptionalCell::empty(),
 
@@ -175,7 +221,7 @@ impl<'a> Spi<'a> {
     }
 
     fn finish_transfer(&self) {
-        self.transmission_type.set(TransmissionType::Idle);
+        self.operating_mode.set(OperatingMode::Idle);
 
         if !self.hold_cs.get() {
             self.cs.map(|pin| pin.set());
@@ -192,7 +238,7 @@ impl<'a> dma::DmaClient for Spi<'a> {
     ) {
         if let Some(buf) = tx_buf {
             // Transmitting finished
-            if self.transmission_type.get() == TransmissionType::Write {
+            if self.operating_mode.get() == OperatingMode::Write {
                 // Only a write operation was done -> invoke callback
 
                 self.finish_transfer();
@@ -266,11 +312,12 @@ impl<'a> spi::SpiMaster for Spi<'a> {
         self.tx_dma.map(|dma| dma.initialize(&tx_conf));
         self.rx_dma.map(|dma| dma.initialize(&rx_conf));
 
+        self.operating_mode.set(OperatingMode::Idle);
         self.clear_module_reset();
     }
 
     fn is_busy(&self) -> bool {
-        self.transmission_type.get() != TransmissionType::Idle
+        self.operating_mode.get() != OperatingMode::Idle
     }
 
     fn read_write_bytes(
@@ -290,14 +337,14 @@ impl<'a> spi::SpiMaster for Spi<'a> {
 
         // If a read-buffer was supplied too, we also start a read transaction
         if let Some(read_buf) = read_buffer {
-            self.transmission_type.set(TransmissionType::WriteRead);
+            self.operating_mode.set(OperatingMode::WriteRead);
             cnt = core::cmp::min(read_buf.len(), write_buffer.len());
 
             let rx_reg = self.registers.rxbuf() as *const ReadOnly<u16> as *const ();
             self.rx_dma
                 .map(move |dma| dma.transfer_periph_to_mem(rx_reg, read_buf, cnt));
         } else {
-            self.transmission_type.set(TransmissionType::Write);
+            self.operating_mode.set(OperatingMode::Write);
         }
 
         // Start a write transaction
@@ -309,15 +356,35 @@ impl<'a> spi::SpiMaster for Spi<'a> {
     }
 
     fn write_byte(&self, val: u8) {
-        todo!()
+        if self.is_busy() {
+            return;
+        }
+
+        while self.registers.statw().is_set(UCSPIxSTATW::UCBUSY) {}
+        self.registers.txbuf().set(val as u16);
+        while self.registers.statw().is_set(UCSPIxSTATW::UCBUSY) {}
     }
 
     fn read_byte(&self) -> u8 {
-        todo!()
+        if self.is_busy() {
+            return 0;
+        }
+
+        while self.registers.statw().is_set(UCSPIxSTATW::UCBUSY) {}
+        self.registers.txbuf().set(0);
+        while self.registers.statw().is_set(UCSPIxSTATW::UCBUSY) {}
+        self.registers.rxbuf().get() as u8
     }
 
     fn read_write_byte(&self, val: u8) -> u8 {
-        todo!()
+        if self.is_busy() {
+            return 0;
+        }
+
+        while self.registers.statw().is_set(UCSPIxSTATW::UCBUSY) {}
+        self.registers.txbuf().set(val as u16);
+        while self.registers.statw().is_set(UCSPIxSTATW::UCBUSY) {}
+        self.registers.rxbuf().get() as u8
     }
 
     fn specify_chip_select(&self, cs: Self::ChipSelect) {
@@ -327,11 +394,18 @@ impl<'a> spi::SpiMaster for Spi<'a> {
     }
 
     fn set_rate(&self, rate: u32) -> u32 {
-        todo!()
+        let clk = SpiClock::from(rate);
+
+        self.set_module_to_reset();
+        self.registers.brw().set(clk as u16);
+        self.clear_module_reset();
+
+        self.clock.set(clk);
+        clk.into()
     }
 
     fn get_rate(&self) -> u32 {
-        todo!()
+        self.clock.get().into()
     }
 
     fn set_clock(&self, polarity: spi::ClockPolarity) {
